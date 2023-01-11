@@ -1,0 +1,731 @@
+---
+title: "EHR ML Intro: Problem Set - Machine Learning"
+author: "Miguel Ángel Armengol de la Hoz"
+output:
+  html_document:
+    df_print: paged
+    fig.align: center
+    fig_caption: yes
+    fig_height: 5
+    fig_width: 9
+    highlight: tango
+    number_sections: no
+    toc: yes
+    toc_depth: '5'
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+  html_notebook:
+    fig.align: center
+    fig_caption: yes
+    fig_height: 5
+    fig_width: 9
+    highlight: tango
+    number_sections: no
+    theme: united
+    toc: yes
+    toc_depth: 5
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+params:
+  showAnswers: T
+editor_options:
+  chunk_output_type: none
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo=T, warning=F)
+```
+
+# Objectives
+
+Participants should leave this workshop with an understang of the basic principles of machine learning (data extraction, exploration, model training, and performance evaluation):
+
+  - Extract vital signs and laboratory results of ICU patients in a certain time window for a specific cohort of patients from eICU databases.
+
+  - Calculate max/average O2/resp/heartRate vitalperiodic in the 24 hrs after admission.
+
+  - Join vitals (vitalperiodic) [and blood pressure from vitalaperiodic] on ICU stay ID (patientunitstayid).
+
+  - Train several types of classifiers that can predict a patient’s survival (outcome: hospitaldischargestatus).
+
+  - Understand how to use random selection of tuning parameter combinations to cover the parameter space to a lesser extent.
+
+  - Learn how to read different performance metrics in order to select the best model for our use case.
+ 
+Data is available at: [eICU Collaborative Research Database Demo]: https://physionet.org/content/eicu-crd-demo/2.0/
+
+
+# Set up
+
+We're going to need the following packages:
+
+```
+library(scales)
+library(RColorBrewer)
+library(data.table)
+library(dplyr)
+library(knitr)
+library(corrplot)
+library(Hmisc)
+library(stats)
+library(tidyverse)
+library(magrittr)
+library(caret)
+library(kernlab) #required for SVM
+require(boot)
+require(pROC)
+library(mlbench)
+library(MLmetrics)
+library(gbm)
+library(xgboost)
+library(oddsratio)
+library(xlsx)
+library(hmeasure)
+library(pROC)
+library(ROCR)
+```
+
+```{r libs, include=F}
+# list.of.packages <- c("bigrquery","plotly","scales","RColorBrewer","data.table","dplyr","knitr","corrplot","Hmisc","stats","kernlab")
+# new.packages<-list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+# if(length(new.packages)) install.packages(new.packages)
+# if(length(new.packages)>0)
+# {install.packages(new.packages)}
+library(scales)
+library(RColorBrewer)
+library(data.table)
+library(dplyr)
+library(knitr)
+library(corrplot)
+library(Hmisc)
+library(stats)
+library(tidyverse)
+library(magrittr)
+library(caret)
+library(kernlab) #required for SVM
+require(boot)
+require(pROC)
+library(mlbench)
+library(MLmetrics)
+library(gbm)
+library(xgboost)
+library(oddsratio)
+library(xlsx)
+library(hmeasure)
+library(pROC)
+library(ROCR)
+```
+
+# The data
+
+For convenience, we have collated all data as an RData archive that can be directly loaded from the following URL: http://publicdata.omics.kitchen/Projects/MMSCI/eicu_demo.RData
+
+## Cache and load the database
+
+The code below will look for this file in your home directory (~/).  If not present will download it for subsequent use.
+```{r}
+path_tmp_data = "~"
+if(!file.exists(paste0(path_tmp_data,"/eicu_demo.RData"))){
+  download.file("http://publicdata.omics.kitchen/Projects/MMSCI/eicu_demo.RData",
+                destfile = paste0(path_tmp_data,"/eicu_demo.RData"), 
+                mode = "wb")
+}
+load(paste0(path_tmp_data,"/eicu_demo.RData"))
+```
+
+
+## eICU
+
+* This paper describes eicu: https://www.nature.com/articles/sdata2018178.
+* This section in particular describes all tables: https://www.nature.com/articles/sdata2018178/tables/4.
+* For more detailed information: https://eicu-crd.mit.edu/about/eicu/.
+
+### Vital signs tables
+
+*Nursecharting*: information entered in a semi-structured form by the nurse
+https://eicu-crd.mit.edu/tutorials/nursecharting/
+
+* Heart Rate (bpm)
+* O2 Saturation (%)
+* Temperature (C) 
+* Non-Invasive BP Systolic (mmHg)
+* Non-Invasive BP Diastolic (mmHg)
+* Invasive BP Systolic (mmHg)
+* Invasive BP Diastolic (mmHg)
+* MAP (mmHg)
+
+*vitalAperiodic*: provides invasive vital sign data which is interfaced into eCareManager at _irregular_ intervals.
+
+* Cardiac output
+* Cardiac Index 
+* Pulmonary artery occlusion pressure ("wedge pressure" - PAOP)
+* SVR / SVRI (Systemic Vascular Resistance and SVR Index)
+* PVR / PVRI (Pulmonary Vascular resistanc and PVR index)
+* _exception of non invasive:_ Non-invasive blood pressure
+
+*vitalPeriodic*: data which is consistently interfaced from bedside vital signs monitors into eCareManager. Data are generally interfaced as 1 minute averages, and archived into the vitalPeriodic table as 5 minute median values.
+
+* Temperature
+* Heart rate _not available in the eICU CRD_
+* SVO2
+* Respiratory rate
+* ICP (intracranial pressure)
+* End Tidal CO2
+* CPP (cerebral perfusion pressure)
+* Mean Invasive blood pressure
+* Pulmonary artery pressure
+* O2 saturation by pulse oximeter _not available in the eICU CRD_
+* CVP (central venous pressure)
+* Invasive blood pressure (systolic and diastolic)
+
+### Laboratory results tables
+
+*lab*: Laboratory tests that have have been mapped to a standard set of measurements.
+https://eicu-crd.mit.edu/tutorials/lab/
+
+# Part 1 - Extraction
+
+First we need to extract and process the data that we will ultimately use to train the classification models.
+
+<!-- ## Part A: Summary statistics  -->
+
+There are two tables containing each patient's vitals:
+
+- `vitalperiodic` - Automated data collection.
+
+- `vitalaperiodic` - Manual data collection by nursing staff.
+
+<details><summary>*Click for Hint*</summary>
+Use the `summary()` function to better understand the structure and contents of these tables.
+</details>
+
+
+
+In both of these tables, the unique ICU visit ID for each patient is given in the `patientunitstayid` column, as is the number of minutes elapsed since admission (`observationoffset`) for each observation.
+
+This matches back to the patient demographics in the `patient` data.frame.
+
+### Problem 1
+
+In the initial 24 hrs after admission, calculate the mean andstandard deviation of each patient's:
+
+- Heart rate (`vitalperiodic$heartrate`)
+
+- O2 saturation (`vitalperiodic$sao2`)
+
+- Respiration (`vitalperiodic$respiration`)
+
+- Systemic cystolic blood pressure (`vitalperiodic$systemicsystolic`)
+
+- Systemic diastolic blood pressure (`vitalperiodic$systemicdiastolic`)
+
+- Non-invasive cystolic blood pressure (`vitalaperiodic$noninvasivesystolic`)
+
+- Non-invasive diastolic blood pressure (`vitalaperiodic$noninvasivediastolic`)
+
+<details><summary>*Click for Hint 1*</summary>
+You are welcome to perform this analysis any way you wish, however using dplyr/tidyverse functions or sqldf SQL syntax will likely make this task much easier.
+</details>
+
+<details><summary>*Click for Hint 2*</summary>
+Remember you want to filter these observations to only those occurring in the first 24hrs of a patient's stay.
+</details>
+
+```{r, include=params$showAnswers}
+vitalperiodic_summary = vitalperiodic %>%
+  dplyr::filter(observationoffset >=0  &&  observationoffset < 60*24) %>%
+  dplyr::group_by(patientunitstayid) %>%
+  dplyr::summarise(n_obs_periodic          = n(),
+                   heartrate_mean          = mean(heartrate,na.rm=T),
+                   heartrate_stdev         = sd(heartrate,na.rm=T),
+                   respiration_mean        = mean(respiration,na.rm=T),
+                   respiration_stdev       = sd(respiration,na.rm=T),
+                   sao2_mean               = mean(sao2, na.rm=T),
+                   sao2_stdev              = sd(sao2, na.rm=T),
+                   systemicsystolic_mean   = mean(systemicsystolic, na.rm=T),
+                   systemicsystolic_stdev  = sd(systemicsystolic, na.rm=T),
+                   systemicdiastolic_mean  = mean(systemicdiastolic, na.rm=T),
+                   systemicdiastolic_stdev = sd(systemicdiastolic, na.rm=T)
+                   )
+```
+
+
+```{r, include=params$showAnswers}
+vitalaperiodic_summary = vitalaperiodic %>%
+  dplyr::filter(observationoffset >=0  &&  observationoffset < 60*24) %>%
+  dplyr::group_by(patientunitstayid) %>%
+  dplyr::summarise(n_obs_nonInvasive          = n(),
+                   noninvasivesystolic_mean   = mean(noninvasivesystolic,na.rm=T),
+                   noninvasivesystolic_stdev  = sd(noninvasivesystolic,na.rm=T),
+                   noninvasivediastolic_mean  = mean(noninvasivediastolic,na.rm=T),
+                   noninvasivediastolic_stdev = sd(noninvasivediastolic,na.rm=T)
+                   )
+```
+
+### Problem 2
+
+Now we must merge these summarized first 24hr data on a patient's vitals with the patient demographics and clinical information.  Using the `patientunitstayid`, merge the periodic vitals, aperiodic vitals, and patient information into a single table with one row per patient-visit.  Call the resulting data.frame/tibble `data_merged`.
+
+
+```{r, include=params$showAnswers}
+data_merged = patient %>%
+  left_join(vitalperiodic_summary, by="patientunitstayid") %>%
+  left_join(vitalaperiodic_summary, by="patientunitstayid")
+```
+
+# Part 2 - Exploration
+
+Now that we have a nicely merged dataset it would be sensible to inspect it a little to see what we're dealing with. You are welcome to make whatever plots, tables, summary statistics you wish to get a feel for these data.  Some questions below are intended to guide you, but are by no means exhaustive.
+
+### Problem 3
+
+- A: Do all patient visits have data on their vitals?  Is there any use in retaining any that don't?
+```{r, include=params$showAnswers}
+# Remove patient visits with missing vitals
+length(which(is.na(data_merged$n_obs_periodic)))
+length(which(is.na(data_merged$n_obs_nonInvasive)))
+data_merged %<>%
+  dplyr::filter(!is.na(n_obs_periodic)  |  !is.na(n_obs_nonInvasive))
+```
+
+- B: How many observations of vitals do patients tend to have?  Do you think it is worth filtering patients with too few observations?
+```{r, include=params$showAnswers}
+# How many vitals did the patient get in the first 24hrs?
+table(table(data_merged$n_obs_periodic))
+table(table(data_merged$n_obs_nonInvasive))
+```
+
+- C: Are the columns in a sensible format - are they the correct data type?
+```{r, include=params$showAnswers}
+summary(data_merged)
+# Fix age
+table(data_merged$age)
+data_merged$age_fixed = as.numeric(data_merged$age)
+data_merged$age_fixed[data_merged$age == "> 89"] = 91.4
+```
+
+- D: Are there any missing values that would be worth excluding given the patient could not contribute to the modeling?  Or any patients that could/should be excluded based on these data?
+```{r, include=params$showAnswers}
+# Some patients do not have a discharge status
+data_merged %>%
+  dplyr::filter(is.na(hospitaldischargestatus))
+data_merged %<>%
+  dplyr::filter(!is.na(hospitaldischargestatus))
+
+# Some patients are discharged before 24hrs:
+data_merged %>%
+  dplyr::filter(hospitaldischargeoffset < 60*24) %>%
+  dplyr::group_by(hospitaldischargestatus, age_fixed > 75) %>%
+  dplyr::summarise(n=n())
+# Most are young and survived, remove these
+data_merged %<>%
+  dplyr::filter(hospitaldischargeoffset > 60*24) 
+```
+
+
+- E: Do any of the variables cluster based on patient outcome (`hospitaldischargestatus`)?
+```{r, include=params$showAnswers}
+# Plot by outcome
+data_merged %>%
+  ggplot(aes(x=hospitaldischargestatus,y=age_fixed)) +geom_violin() +geom_boxplot()
+
+data_merged %>%
+  ggplot(aes(x=hospitaldischargestatus,y=respiration_mean)) +geom_violin() +geom_boxplot()
+
+data_merged %>%
+  ggplot(aes(x=hospitaldischargestatus,y=heartrate_mean)) +geom_violin() +geom_boxplot(notch=T)
+
+data_merged %>%
+  ggplot(aes(x=hospitaldischargestatus,y=heartrate_stdev)) +geom_violin() +geom_boxplot(notch=T)
+
+data_merged %>%
+  ggplot(aes(x=hospitaldischargestatus,y=sao2_mean)) +geom_violin() +geom_boxplot(notch=T)
+
+data_merged %>%
+  ggplot(aes(x=hospitaldischargestatus,y=sao2_stdev)) +geom_violin() +geom_boxplot(notch=T)
+
+data_merged %>%
+  ggplot(aes(x=hospitaldischargestatus,y=hospitaldischargeoffset)) +geom_violin() +geom_boxplot(notch=T) +
+  coord_cartesian(ylim=c(0,60*25)) +geom_hline(yintercept=60*24)
+```
+
+
+### Problem 4
+
+Not all data in `data_merged` are suitable for modeling.  Select a subset of the columns that we want to include as predictors in the classification.
+
+Whatever you choose, remember to keep at least `hospitaldischargestatus` as this will be our outcome variable!
+
+hint: not suitable: age, apacheadmissiondx
+
+```{r, include=params$showAnswers}
+#keep_cols = c("gender","age_fixed","ethnicity","hospitalid","wardid","admissionheight",
+#              "hospitaldischargestatus","unittype","unitvisitnumber",
+#              "unitstaytype","admissionweight","heartrate_mean","heartrate_stdev","heartrate_max","respiration_mean",
+#              "respiration_stdev","respiration_max","sao2_mean","sao2_stdev","sao2_max","systemicsystolic_mean",
+#              "systemicsystolic_stdev","systemicsystolic_max","systemicdiastolic_mean","systemicdiastolic_stdev",
+#              "systemicdiastolic_max","noninvasivesystolic_mean","noninvasivesystolic_stdev","noninvasivesystolic_max",
+#              "noninvasivediastolic_mean","noninvasivediastolic_stdev","noninvasivediastolic_max")
+
+keep_cols = c("gender","age_fixed","hospitalid","wardid","admissionheight",
+              "hospitaldischargestatus","admissionweight","heartrate_mean","heartrate_stdev","respiration_mean",
+              "respiration_stdev","sao2_mean","sao2_stdev",
+              "noninvasivesystolic_mean","noninvasivesystolic_stdev",
+              "noninvasivediastolic_mean","noninvasivediastolic_stdev")
+
+data_toModel = as.data.frame(data_merged[, keep_cols])
+rownames(data_toModel) = data_merged$patientunitstayid
+```
+
+```{r, include=params$showAnswers}
+summary(data_toModel)
+```
+
+
+
+# Part 3 - Training
+
+The objective here is to train several types of classifiers that can predict a patient's survival (`hospitaldischargestatus`) based on the data we've collected and summarised above.
+
+## Training/Test sets
+
+Often when training predictive models/classifiers it is beneficial to reserve a small fraction of the input data as a true test set. This will form the gold-standard for evaluating the trained models. 
+
+Here we're going to lean heavily on the wonderful [caret](https://topepo.github.io/caret/) package to do the partitioning of the data into training/test sets, as well as train and evaluate the models.
+
+### Problem 4
+
+Use the `createDataPartition` function to split 75%/25% of the data into training/test sets, respectively, based on the individual's survival. (`hospitaldischargestatus`).  
+
+<details><summary>*Click for Hint*</summary>
+Use the `set.seed()` function to make sure the random numbers generated in splitting training and test sets are reproducible.
+</details>
+
+```{r, include=params$showAnswers}
+## set the seed to make our partition reproducible
+set.seed(13579)
+
+# createDataPartition: "the random sampling is done within the levels of y when y is a factor in an attempt to balance the class distributions within the splits."
+## 75% of the sample size
+idx_train  = createDataPartition(as.factor(data_toModel$hospitaldischargestatus), times = 1, p = 0.75, list=F)[,1]
+data_train = data_toModel[idx_train, ]
+data_test  = data_toModel[-idx_train, ]
+data_test$patientunitstayid = rownames(data_test)
+
+#Checking outcome is actually balanced
+round(prop.table(table(data_toModel$hospitaldischargestatus)),2)
+round(prop.table(table(data_train$hospitaldischargestatus)),2)
+round(prop.table(table(data_test$hospitaldischargestatus)),2)
+```
+
+### Problem 5
+
+Define a model of the form `hospitaldischargestatus ~ predictor1 + predictor2 + ...` to train the classifier.
+
+```{r, include=params$showAnswers}
+# defining outcome, exposures
+outcome_model = "hospitaldischargestatus"
+exposures_model = names(data_toModel)
+exposures_model = exposures_model[-which(exposures_model == outcome_model)]
+
+outcome_and_exposure <- as.formula(paste(outcome_model, "~", paste(exposures_model, collapse = " + ")))
+```
+
+### Problem 6
+
+Check that the other variables included in your model are represented approximately equally across the training and test sets. What should we do with any missing values (especially in the test set)?
+
+```{r, include=params$showAnswers}
+library(table1)
+#table1(~ Sex + Age + Race + BMI + hsTnT + NTproBNP + CRP + Outcome + DNR_DNI | unit + CV, data=data_toModel, overall=F)
+
+tmp = as.data.frame(data_toModel)
+tmp$trainTest = "TestSet"
+tmp$trainTest[idx_train] = "TrainingSet"
+table1(as.formula(paste0(" ~ ",paste(exposures_model, collapse = " + ")," | trainTest")), data=tmp, overall=F)
+```
+
+```{r, include=params$showAnswers}
+# Remove NA values in the test set
+tmp_data_test = na.omit(data_test)
+test_samples_removed = data_test$ID[ ! data_test$ID %in% tmp_data_test$ID]
+data_test = tmp_data_test
+```
+
+```{r, include=params$showAnswers}
+tmp = as.data.frame(data_toModel)
+tmp$trainTest = "TestSet"
+tmp$trainTest[idx_train] = "TrainingSet"
+tmp %<>% 
+  rownames_to_column("ID") %>%
+  filter(! ID %in% test_samples_removed)
+table1(as.formula(paste0(" ~ ",paste(exposures_model, collapse = " + ")," | trainTest")), data=tmp, overall=F)
+```
+
+
+```{r, include=params$showAnswers}
+# Save
+save(data_toModel, data_train, data_test, exposures_model, outcome_and_exposure,
+     file="~/MMSCI_data_and_model.RData")
+```
+
+
+## Hyperparameter Tuning
+
+The default method for optimizing tuning parameters is to use a grid search. This approach is usually effective but, in cases when there are many tuning parameters, it can be inefficient. An alternative is to use a combination of grid search and racing. Another is to use a random selection of tuning parameter combinations to cover the parameter space to a lesser extent.
+
+###  Problem 7
+
+Define the hyperparameters using the `trainControl` function in `caret`.  Use 10-fold cross-validation for two classes, and a random search.  What do you think you should do about the large imbalance in classes (many more patients survived than expired)?  Can `trainControl` help you here?
+
+For a random search with the kind of binary outcomes we have here, use the following arguments to `trainControl`:
+```
+classProbs = TRUE,
+summaryFunction = twoClassSummary,
+verboseIter = F,
+search = "random"
+```
+
+<details><summary>*Click for Hint*</summary>
+10-fold cross-validation can be specified using a function of the following form:
+```
+method = "repeatedcv",
+number = 10,
+repeats = 1,
+```
+</details>
+
+
+
+```{r, include=params$showAnswers}
+set.seed(13579)
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 1,
+                           classProbs = TRUE,
+                           summaryFunction = twoClassSummary,
+                           verboseIter = F,
+                           search = "random",
+                           sampling = "down")
+```
+
+
+## Train the models
+
+Here we will train a variety of classifiers using different machine learning algorithms:
+
+- `gbm`: Stochastic Gradient Boosting
+
+- `svmRadial`: Support Vector Machine (with radial basis)
+
+- `rf`: Random Forest
+
+- `xgbTree`: eXtreme Gradient Boosting
+
+- `LogitBoost`: Boosted Logistic Regression
+
+There are **many** more methods that can be used [Available models in caret](https://rdrr.io/cran/caret/man/models.html)
+
+### Problem 8
+
+Use the `train()` function in `caret` to train each of the 5 models above.  Use the training data you created in Problem 4 and the `trainControl` you specified in Problem 7. 
+
+For `svmRadial` you'll likely want to add the `preProc = c("center", "scale")` argument.
+
+<details><summary>*Click for Hint*</summary>
+You might want to specify `metric=ROC` as the metric.
+</details>
+
+<details><summary>*Click for Hint*</summary>
+To train the gbm model you could use the following :
+```
+fit_gbm <- train(outcome_and_exposure,
+                 data = data_train,
+                 method = "gbm",
+                 trControl = fitControl,
+                 verbose = F,
+                 na.action = na.omit,
+                 metric = "ROC" ## Specify which metric to optimize,
+)
+```
+</details>
+
+```{r eval=T, message=F, include=params$showAnswers}
+# Machine learning methods
+fit_gbm <- train(outcome_and_exposure,
+                 data = data_train,
+                 method = "gbm",
+                 trControl = fitControl,
+                 verbose = F,
+                 na.action = na.omit,
+                 metric = "ROC" ## Specify which metric to optimize,
+)
+fit_svm <- train(outcome_and_exposure,
+                 data = data_train,
+                 method = "svmRadial",
+                 trControl = fitControl,
+                 preProc = c("center", "scale"),
+                 tuneLength = 8,
+                 verbose = F,
+                 na.action = na.omit,
+                 metric = "ROC" ## Specify which metric to optimize
+)
+fit_rf <- train(outcome_and_exposure,
+                data = data_train,
+                method = "rf",
+                trControl = fitControl,
+                verbose = F,
+                na.action = na.omit,
+                metric = "ROC" ## Specify which metric to optimize
+)
+fit_xgb <- train(outcome_and_exposure,
+                 data = data_train,
+                 method = "xgbTree",
+                 trControl = fitControl,
+                 verbose = F,
+                 na.action = na.omit,
+                 metric = "ROC" ## Specify which metric to optimize
+)
+fit_lr <- train(outcome_and_exposure,
+                data = data_train,
+                method = "LogitBoost",
+                trControl = fitControl,
+                verbose = F,
+                na.action = na.omit,
+                metric = "ROC" ## Specify which metric to optimize
+)
+```
+
+# Part 4 - Evaluation
+
+In the final section we will evaluate the performance of the various ML models.  We can use the `resamples` function in `caret` to summarise the performance:
+
+```{r eval=T, include=T}
+resamps <- resamples(list(fit_gbm = fit_gbm,
+                          fit_svm = fit_svm,
+                          fit_rf  = fit_rf,
+                          fit_xgb = fit_xgb,
+                          fit_lr = fit_lr
+                          ))
+summary_resamps = as.data.frame(summary(resamps)$statistics)
+```
+
+```{r eval=T, include=params$showAnswers}
+summary_resamps %>% t() %>% kable()
+```
+
+
+## Selecting the model with the best performance
+
+Depending on the clinical question, a different performance metric can be chosen, for this example will choose the area under the receiver operating characteristic (AUROC).  
+
+AUROC is a function of the true positive rate (sensitivity) versus the false positive rate (1-specificity), integrated over all thresholds. An AUROC of 0.50 is achieved through random predictions, 1 represents a perfect discrimination.
+
+### Problem 9
+
+What is the highest-performing model accoring to median AUROC?
+
+```{r eval=T, include=params$showAnswers}
+# we save the best performing model (based on its ROC) and its name
+best_performing_model<-get(
+  rownames(summary_resamps)[which(summary_resamps$ROC.Median==max(summary_resamps$ROC.Median))]
+)
+# extracts name as string from model
+best_performing_model_name<-best_performing_model$method 
+best_performing_model_name
+```
+
+
+## Evaluating the predictor
+
+Use the following function to calculate the final predictions for all test-set data in all models
+
+```{r eval=T, include=T}
+getFinalPredictions = function(use_fit, data_test, prob_threshold=0.5){
+  # We create the probabilities dataset using our best performing model.
+  prediction_probabilities_tmp = predict(use_fit, newdata=data_test, type = "prob")
+  #nrow(prediction_probabilities_tmp) / nrow(data_test)
+  rownames(prediction_probabilities_tmp) = data_test$patientunitstayid
+  
+  # bind our prediction with the actual data
+  final_predictions_tmp = tibble(ID         = data_test$patientunitstayid,
+                                 trueStatus = data_test$hospitaldischargestatus,
+                                 obs        = if_else(trueStatus == "Alive",1,0))
+  final_predictions_tmp = cbind(final_predictions_tmp, 
+                                prediction_probabilities_tmp[match(final_predictions_tmp$ID,
+                                                                   rownames(prediction_probabilities_tmp)),])
+  
+  final_predictions_tmp %<>%
+    dplyr::mutate(pred=dplyr::if_else(Alive > prob_threshold, 1, 0))
+  
+  final_predictions_tmp
+}
+
+final_predictions = getFinalPredictions(best_performing_model, data_test)
+final_predictions_svm = getFinalPredictions(fit_svm, data_test)
+final_predictions_gbm = getFinalPredictions(fit_gbm, data_test)
+final_predictions_rf = getFinalPredictions(fit_rf, data_test)
+final_predictions_xgb = getFinalPredictions(fit_xgb, data_test)
+final_predictions_lr = getFinalPredictions(fit_lr, data_test)
+```
+
+
+### Problem 10
+
+Plot ROC curves for all models to visually compare them.
+
+```{r eval=T, include=params$showAnswers}
+# AUROC per method
+auc_svm<-auc(roc(relabel(final_predictions_svm$obs),relabel(final_predictions_svm$pred) ))
+auc_gbm<-auc(roc(relabel(final_predictions_gbm$obs),relabel(final_predictions_gbm$pred) ))
+auc_rf<-auc(roc(relabel(final_predictions_rf$obs),relabel(final_predictions_rf$pred) ))
+auc_xgb<-auc(roc(relabel(final_predictions_xgb$obs),relabel(final_predictions_xgb$pred) ))
+auc_lr<-auc(roc(relabel(final_predictions_lr$obs),relabel(final_predictions_lr$pred) ))
+
+# AUROC data
+perf_svm <- performance(prediction(final_predictions_svm$Alive, final_predictions_svm$obs),"tpr","fpr")
+perf_gbm <- performance(prediction(final_predictions_gbm$Alive, final_predictions_gbm$obs),"tpr","fpr")
+perf_rf <- performance(prediction(final_predictions_rf$Alive, final_predictions_rf$obs),"tpr","fpr")
+perf_xgb <- performance(prediction(final_predictions_xgb$Alive, final_predictions_xgb$obs),"tpr","fpr")
+perf_lr <- performance(prediction(final_predictions_lr$Alive, final_predictions_lr$obs),"tpr","fpr")
+
+# Merge
+all_rocs = NULL
+all_rocs = rbind(all_rocs, tibble(x=perf_svm@x.values[[1]],y=perf_svm@y.values[[1]],method='SVM',auc=as.numeric(auc_svm)))
+all_rocs = rbind(all_rocs, tibble(x=perf_gbm@x.values[[1]],y=perf_gbm@y.values[[1]],method='GBM',auc=as.numeric(auc_gbm)))
+all_rocs = rbind(all_rocs, tibble(x=perf_rf@x.values[[1]],y=perf_rf@y.values[[1]],method='RF',auc=as.numeric(auc_rf)))
+all_rocs = rbind(all_rocs, tibble(x=perf_xgb@x.values[[1]],y=perf_xgb@y.values[[1]],method='XGB',auc=as.numeric(auc_xgb)))
+all_rocs = rbind(all_rocs, tibble(x=perf_lr@x.values[[1]],y=perf_lr@y.values[[1]],method='LR',auc=as.numeric(auc_lr)))
+all_rocs$auc<-round(as.numeric(all_rocs$auc),2)
+  
+all_rocs %>%
+  ggplot(aes(x=x, y=y, colour=paste0(method,': ',auc))) +
+  geom_abline(slope=1,intercept=0) +
+  geom_line() +
+  theme_minimal() +
+  labs(colour="Method AUROC") +
+  xlab('1 - Specificity') +
+  ylab('Sensitivity')
+```
+
+
+### Problem 11
+
+Summarise the variable importance in the top performing model(s)
+
+```{r eval=T, include=params$showAnswers}
+variable_importance = varImp(fit_rf, scale = T)
+
+ggplot(variable_importance) +theme_minimal() 
+
+
+variable_importance = as.data.frame(variable_importance[["importance"]])
+variable_importance$variable = rownames(variable_importance)
+
+variable_importance %>%
+  arrange(desc(Overall)) %>%
+  kable()
+```
+
